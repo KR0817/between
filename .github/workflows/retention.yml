@@ -1,0 +1,44 @@
+name: Retention maintenance
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: retention-maintenance
+  cancel-in-progress: false
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Run bounded storage cleanup
+        env:
+          SITE_ORIGIN: ${{ vars.SITE_ORIGIN }}
+          MAINTENANCE_TOKEN: ${{ secrets.MAINTENANCE_TOKEN }}
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          const origin = new URL(process.env.SITE_ORIGIN || 'https://invalid.invalid');
+          if (origin.protocol !== 'https:' || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) throw new Error('Configure an HTTPS SITE_ORIGIN.');
+          const token = process.env.MAINTENANCE_TOKEN;
+          if (!token || token.length < 32) throw new Error('Configure the maintenance secret.');
+          let completed = false;
+          for (let attempt = 0; attempt < 30; attempt++) {
+            try {
+              const response = await fetch(new URL('/api/maintenance', origin), { method: 'POST', redirect: 'error', headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(45000) });
+              if (!response.ok) throw new Error(`Maintenance HTTP ${response.status}`);
+              const result = await response.json();
+              if (result.status !== 'ok') throw new Error('Maintenance reported incomplete cleanup.');
+              if (!result.more) {
+                completed = true;
+                console.log('Authenticated maintenance completed.');
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, result.pendingUploads ? 5000 : 1000));
+            } catch {
+              if (attempt < 29) await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+          }
+          if (!completed) throw new Error('Maintenance failed; check the operator dashboard and retry.');
+          JS
